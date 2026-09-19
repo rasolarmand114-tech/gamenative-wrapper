@@ -8,7 +8,7 @@
 #include "wrapper_log.h"
 
 #define LIBNAME "/system/lib64/libgraphicsenv.so"
-#define WRAPPER_LAYERS_PATH "/data/data/com.winlator.cmod/files/imagefs/usr/lib:/data/data/com.termux/files/usr/lib"
+#define WRAPPER_LAYERS_PATH "/data/data/com.winlator.mali/files/imagefs/usr/lib:/data/data/com.termux/files/usr/lib"
 
 static void *graphicsenv_handle = nullptr;
 static std::string env_layers_path;
