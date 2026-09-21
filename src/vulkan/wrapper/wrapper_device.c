@@ -31,6 +31,74 @@ const struct vk_device_extension_table wrapper_device_extensions =
    .KHR_present_id = true,
    .KHR_present_wait = true,
    .KHR_incremental_present = true,
+   /*
+    * Wrapper always wants these advertised/forwarded.
+    */
+   .KHR_driver_properties = true,
+   .KHR_device_group = true,
+   .KHR_zero_initialize_workgroup_memory = true,
+   .EXT_multisampled_render_to_single_sampled = true,
+   /*
+    * Plain pass-through extensions that wrapper_append_required_extensions()
+    * already requests explicitly, by name, whenever the driver supports
+    * them. Listed here too purely so wrapper_enable_all_driver_extensions()'s
+    * blanket sweep (below) skips them -- every extension must only ever be
+    * added to ppEnabledExtensionNames from one place, or the driver ends up
+    * handed the same string twice.
+    */
+   .KHR_external_fence = true,
+   .KHR_external_semaphore = true,
+   .KHR_external_memory = true,
+   .KHR_external_fence_fd = true,
+   .KHR_external_semaphore_fd = true,
+   .KHR_external_memory_fd = true,
+   .KHR_dedicated_allocation = true,
+   .EXT_queue_family_foreign = true,
+   .KHR_maintenance1 = true,
+   .KHR_maintenance2 = true,
+   .KHR_image_format_list = true,
+   .KHR_timeline_semaphore = true,
+   .KHR_get_memory_requirements2 = true,
+   .KHR_vulkan_memory_model = true,
+   .KHR_bind_memory2 = true,
+   .KHR_copy_commands2 = true,
+   .EXT_external_memory_host = true,
+   .EXT_external_memory_dma_buf = true,
+   .EXT_external_memory_acquire_unmodified = true,
+   .EXT_image_drm_format_modifier = true,
+   .ANDROID_external_memory_android_hardware_buffer = true,
+   /*
+    * VK_EXT_device_fault is appended explicitly in wrapper_CreateDevice()
+    * based on WRAPPER_DEVICE_FAULT, never via an app request -- skip it here
+    * too so the blanket sweep can't add it a second time.
+    */
+   .EXT_device_fault = true,
+   /*
+    * Both vertex_attribute_divisor aliases are handled by the dedicated
+    * EXT<->KHR aliasing logic in wrapper_filter_enabled_extensions() and
+    * process_pnext_chain(), which can add whichever alias the app did NOT
+    * request. Keeping both out of the blanket sweep avoids it silently
+    * adding the other alias behind that logic's back.
+    */
+   .EXT_vertex_attribute_divisor = true,
+   .KHR_vertex_attribute_divisor = true,
+};
+
+/*
+ * Extensions device creation *requires* unconditionally from the underlying
+ * driver -- checked and force-enabled explicitly in wrapper_CreateDevice()
+ * (buffer_device_address), or conditionally required + force-enabled for
+ * Mali Valhall parts with more than one shader core (the dynamic-rendering
+ * set -- see the Mali Valhall block below). Skipped by the blanket sweep;
+ * added to the enable list by their own dedicated code paths instead.
+ */
+const struct vk_device_extension_table wrapper_mandatory_extensions =
+{
+   .KHR_buffer_device_address = true,
+   .KHR_dynamic_rendering = true,
+   .KHR_dynamic_rendering_local_read = true,
+   .EXT_dynamic_rendering_unused_attachments = true,
+   .KHR_multiview = true,
 };
 
 const struct vk_device_extension_table wrapper_filter_extensions =
@@ -40,6 +108,212 @@ const struct vk_device_extension_table wrapper_filter_extensions =
    .KHR_shared_presentable_image = true,
    .EXT_image_compression_control_swapchain = true,
 };
+
+struct wrapper_known_bug_entry {
+   VkDriverId driver_id;
+   const char *extension_name;
+   const char *note;
+};
+
+/*
+ * Keep this table short and evidence-based. Each entry should map to a
+ * genuinely observed, driver-specific bug -- not a hunch. Gate the whole
+ * mechanism behind WRAPPER_IGNORE_KNOWN_BUGS=1 for bisecting.
+ */
+static const struct wrapper_known_bug_entry wrapper_known_bugs[] = {
+   {
+      .driver_id = VK_DRIVER_ID_ARM_PROPRIETARY,
+      .extension_name = "VK_EXT_transform_feedback",
+      .note = "Unstable transform feedback + robustness2 interaction on some Mali driver builds",
+   },
+   {
+      .driver_id = VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+      .extension_name = "VK_EXT_multisampled_render_to_single_sampled",
+      .note = "Resolve-target corruption observed on some legacy Adreno driver builds",
+   },
+};
+
+static bool
+wrapper_extension_has_known_bug(struct wrapper_physical_device *pdevice,
+                                const char *extension_name)
+{
+   static int wrapper_ignore_known_bugs = -1;
+
+   if (wrapper_ignore_known_bugs == -1) {
+      wrapper_ignore_known_bugs = getenv("WRAPPER_IGNORE_KNOWN_BUGS") ?
+         atoi(getenv("WRAPPER_IGNORE_KNOWN_BUGS")) : 0;
+   }
+
+   if (wrapper_ignore_known_bugs)
+      return false;
+
+   VkDriverId driver_id = pdevice->driver_properties.driverID;
+
+   for (size_t i = 0; i < sizeof(wrapper_known_bugs) / sizeof(wrapper_known_bugs[0]); i++) {
+      if (wrapper_known_bugs[i].driver_id != driver_id)
+         continue;
+      if (strcmp(wrapper_known_bugs[i].extension_name, extension_name) != 0)
+         continue;
+
+      WRAPPER_LOG(info, "Withholding %s: %s", extension_name,
+                  wrapper_known_bugs[i].note);
+      return true;
+   }
+
+   return false;
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * Mali Valhall GPU / driver identification
+ * ---------------------------------------------------------------------
+ * GPU id is never assumed -- it is read back from the device via
+ * VkPhysicalDeviceProperties.deviceID (which on the ARM proprietary driver
+ * carries the raw GPU_ID register value; the upper 16 bits are the product
+ * id used below), gated on vendorID/driverID actually being ARM/Mali first.
+ * Only once that identity is confirmed do we consult the table and decide
+ * what to enforce.
+ * ---------------------------------------------------------------------
+ */
+
+#define WRAPPER_MALI_VENDOR_ID 0x13B5
+
+struct wrapper_mali_gpu_entry {
+   const char *name;
+   const char *architecture;
+   uint16_t product_id;    /* upper 16 bits of the raw GPU_ID register */
+   uint32_t model_id_raw;  /* full raw GPU_ID register value */
+};
+
+static const struct wrapper_mali_gpu_entry wrapper_mali_valhall_table[] = {
+   { "Mali-G57",   "Valhall v9",  0x9001, 0x90010000 },
+   { "Mali-G57",   "Valhall v9",  0x9003, 0x90030000 },
+   { "Mali-G68",   "Valhall v9",  0x9004, 0x90040000 },
+   { "Mali-G77",   "Valhall v9",  0x9000, 0x90000000 },
+   { "Mali-G78",   "Valhall v9",  0x9002, 0x90020000 },
+   { "Mali-G78AE", "Valhall v9",  0x9005, 0x90050000 },
+   { "Mali-G310",  "Valhall v10", 0xA004, 0xA0040000 },
+   { "Mali-G510",  "Valhall v10", 0xA003, 0xA0030000 },
+   { "Mali-G610",  "Valhall v10", 0xA007, 0xA0070000 },
+   { "Mali-G710",  "Valhall v10", 0xA002, 0xA0020000 },
+   { "Mali-G615",  "Valhall v11", 0xB003, 0xB0030000 },
+   { "Mali-G715",  "Valhall v11", 0xB002, 0xB0020000 },
+};
+
+/* Step 1: confirm this is actually an ARM Mali device, then look the
+ * driver-reported GPU id up in the Valhall table. Returns NULL for anything
+ * that isn't ARM/Mali or isn't a recognized Valhall part. */
+static const struct wrapper_mali_gpu_entry *
+wrapper_lookup_mali_gpu(struct wrapper_physical_device *pdevice)
+{
+   if (pdevice->properties2.properties.vendorID != WRAPPER_MALI_VENDOR_ID)
+      return NULL;
+
+   if (pdevice->driver_properties.driverID != VK_DRIVER_ID_ARM_PROPRIETARY)
+      return NULL;
+
+   uint32_t gpu_id = pdevice->properties2.properties.deviceID;
+   uint16_t product_id = (uint16_t)(gpu_id >> 16);
+
+   for (size_t i = 0; i < sizeof(wrapper_mali_valhall_table) / sizeof(wrapper_mali_valhall_table[0]); i++) {
+      if (wrapper_mali_valhall_table[i].product_id == product_id)
+         return &wrapper_mali_valhall_table[i];
+   }
+
+   return NULL;
+}
+
+/* Step 2: once we know it's a Valhall part, read the shader-core count off
+ * the driver-reported name string ("Mali-G710 MC10", or the older "MPx"
+ * naming). Never guessed -- if the driver doesn't report a count we treat it
+ * as unknown and do not enforce anything. */
+static int
+wrapper_mali_core_count(struct wrapper_physical_device *pdevice)
+{
+   const char *name = pdevice->properties2.properties.deviceName;
+
+   const char *suffix = strstr(name, "MC");
+   if (!suffix)
+      suffix = strstr(name, "MP");
+   if (!suffix)
+      return -1;
+
+   int count = atoi(suffix + 2);
+   return count > 0 ? count : -1;
+}
+
+/* Step 3: identify, then decide. Only Valhall GPUs reporting MC2/MP2 or
+ * higher require dynamic rendering + multiview; MC1/MP1 and unknown core
+ * counts are exempt. */
+static bool
+wrapper_mali_requires_dynamic_rendering(struct wrapper_physical_device *pdevice)
+{
+   const struct wrapper_mali_gpu_entry *gpu = wrapper_lookup_mali_gpu(pdevice);
+   if (!gpu)
+      return false;
+
+   int core_count = wrapper_mali_core_count(pdevice);
+   if (core_count < 2)
+      return false;
+
+   WRAPPER_LOG(info,
+      "Detected %s (%s, GPU_ID 0x%08x, %d shader cores) -- enforcing "
+      "VK_KHR_dynamic_rendering / VK_KHR_dynamic_rendering_local_read / "
+      "VK_EXT_dynamic_rendering_unused_attachments / VK_KHR_multiview",
+      gpu->name, gpu->architecture,
+      pdevice->properties2.properties.deviceID, core_count);
+
+   return true;
+}
+
+/* Hard gate: device creation must not proceed if a Valhall MC2+ part is
+ * detected but the driver can't actually back the requirement. */
+static VkResult
+wrapper_check_valhall_mandatory_extensions(struct wrapper_physical_device *pdevice)
+{
+   bool have_dynamic_rendering =
+      pdevice->base_supported_extensions.KHR_dynamic_rendering ||
+      pdevice->properties2.properties.apiVersion >= VK_API_VERSION_1_3;
+   bool have_local_read =
+      pdevice->base_supported_extensions.KHR_dynamic_rendering_local_read;
+   bool have_unused_attachments =
+      pdevice->base_supported_extensions.EXT_dynamic_rendering_unused_attachments;
+   bool have_multiview =
+      pdevice->base_supported_extensions.KHR_multiview ||
+      pdevice->properties2.properties.apiVersion >= VK_API_VERSION_1_1;
+
+   if (!have_dynamic_rendering || !have_local_read ||
+       !have_unused_attachments || !have_multiview) {
+      WRAPPER_LOG(error,
+         "Mali Valhall MC2+ GPU detected but the driver is missing a "
+         "mandatory extension (dynamic_rendering=%d local_read=%d "
+         "unused_attachments=%d multiview=%d)",
+         have_dynamic_rendering, have_local_read,
+         have_unused_attachments, have_multiview);
+      return VK_ERROR_EXTENSION_NOT_PRESENT;
+   }
+
+   if (!pdevice->base_supported_features.dynamicRendering ||
+       !pdevice->base_supported_features.dynamicRenderingLocalRead ||
+       !pdevice->base_supported_features.dynamicRenderingUnusedAttachments ||
+       !pdevice->base_supported_features.multiview) {
+      WRAPPER_LOG(error,
+         "Mali Valhall MC2+ GPU detected but the driver does not expose the "
+         "matching feature bits");
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
+   return VK_SUCCESS;
+}
+
+static void
+wrapper_append_valhall_extensions(uint32_t *count, const char **exts)
+{
+   exts[(*count)++] = "VK_KHR_dynamic_rendering";
+   exts[(*count)++] = "VK_KHR_dynamic_rendering_local_read";
+   exts[(*count)++] = "VK_EXT_dynamic_rendering_unused_attachments";
+   exts[(*count)++] = "VK_KHR_multiview";
+}
 
 inline struct wrapper_buffer *
 get_wrapper_buffer_from_handle_locked(struct wrapper_device *device, VkBuffer buffer) {
@@ -95,6 +369,9 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
       if (wrapper_device_extensions.extensions[idx])
          continue;
 
+      if (wrapper_mandatory_extensions.extensions[idx])
+         continue;
+
       if (wrapper_filter_extensions.extensions[idx])
          continue;
 
@@ -121,6 +398,54 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
    }
 }
 
+/*
+ * Enable every extension the driver supports that isn't already covered by
+ * something else, so the wrapper transparently exposes the underlying
+ * driver's full capability instead of only the subset an app happened to
+ * request or the wrapper happens to hardcode.
+ *
+ * Skipped here (each is added to the enable list from exactly one place):
+ *   - not supported by the base driver at all
+ *   - already requested by the app (handled by wrapper_filter_enabled_extensions,
+ *     aliasing included -- this also protects the app's own explicit
+ *     requests for something wrapper_device_extensions doesn't cover)
+ *   - wrapper-owned or already-required (wrapper_device_extensions)
+ *   - conditionally mandatory (wrapper_mandatory_extensions)
+ *   - deliberately withheld (wrapper_filter_extensions)
+ *   - flagged with a known driver bug (wrapper_extension_has_known_bug)
+ */
+static void
+wrapper_enable_all_driver_extensions(struct wrapper_device *device,
+                                     uint32_t *enable_extension_count,
+                                     const char **enable_extensions)
+{
+   struct wrapper_physical_device *pdevice = device->physical;
+
+   for (int idx = 0; idx < VK_DEVICE_EXTENSION_COUNT; idx++) {
+      if (!pdevice->base_supported_extensions.extensions[idx])
+         continue;
+
+      if (device->vk.enabled_extensions.extensions[idx])
+         continue;
+
+      if (wrapper_device_extensions.extensions[idx])
+         continue;
+
+      if (wrapper_mandatory_extensions.extensions[idx])
+         continue;
+
+      if (wrapper_filter_extensions.extensions[idx])
+         continue;
+
+      const char *extension_name = vk_device_extensions[idx].extensionName;
+
+      if (wrapper_extension_has_known_bug(pdevice, extension_name))
+         continue;
+
+      enable_extensions[(*enable_extension_count)++] = extension_name;
+   }
+}
+
 static inline void
 wrapper_append_required_extensions(const struct vk_device *device,
                                   uint32_t *count,
@@ -143,10 +468,29 @@ wrapper_append_required_extensions(const struct vk_device *device,
    REQUIRED_EXTENSION(KHR_image_format_list)
    REQUIRED_EXTENSION(KHR_swapchain);
    REQUIRED_EXTENSION(KHR_timeline_semaphore);
+   REQUIRED_EXTENSION(KHR_get_memory_requirements2);
+   REQUIRED_EXTENSION(KHR_vulkan_memory_model);
+   REQUIRED_EXTENSION(KHR_bind_memory2);
+   REQUIRED_EXTENSION(KHR_copy_commands2);
    REQUIRED_EXTENSION(EXT_external_memory_host);
    REQUIRED_EXTENSION(EXT_external_memory_dma_buf);
+   REQUIRED_EXTENSION(EXT_external_memory_acquire_unmodified);
    REQUIRED_EXTENSION(EXT_image_drm_format_modifier);
+   /*
+    * NOTE: intentionally NOT dropped, despite the "DMA-BUF only" request --
+    * this device also emulates B8G8R8A8 swapchain images via AHB
+    * (see wrapper_CreateImage's is_emulated_bgra8 handling and is_wsi_image
+    * below), which strongly suggests Android's WSI layer here allocates
+    * presentable images through AHardwareBuffer. Removing this extension
+    * would very likely break swapchain/presentation entirely. Flagged in
+    * chat for a decision instead of silently applied.
+    */
    REQUIRED_EXTENSION(ANDROID_external_memory_android_hardware_buffer);
+   REQUIRED_EXTENSION(KHR_buffer_device_address);
+   REQUIRED_EXTENSION(KHR_driver_properties);
+   REQUIRED_EXTENSION(KHR_device_group);
+   REQUIRED_EXTENSION(KHR_zero_initialize_workgroup_memory);
+   REQUIRED_EXTENSION(EXT_multisampled_render_to_single_sampled);
 #undef REQUIRED_EXTENSION
 }
 
@@ -217,18 +561,304 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceVulkan12Features from pNext chain");
              unlink_vk_struct(create_info, &current, &prev);
              continue;
-          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
-             if (api_version >= VK_MAKE_VERSION(1, 3, 0))
-                break;
-             WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceVulkan13Features from pNext chain");
-             unlink_vk_struct(create_info, &current, &prev);
-             continue;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+             if (api_version < VK_MAKE_VERSION(1, 3, 0)) {
+                WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceVulkan13Features from pNext chain");
+                unlink_vk_struct(create_info, &current, &prev);
+                continue;
+             }
+             /*
+              * Driver reports Vulkan 1.3. Rather than trusting the whole
+              * struct blindly (or stripping it wholesale like the 1.1/1.2
+              * fallback above), clamp every individual bit to what this
+              * specific driver actually advertises.
+              */
+             VkPhysicalDeviceVulkan13Features *features13 =
+                (VkPhysicalDeviceVulkan13Features *)current;
+#define CLAMP13(f) features13->f &= pdevice->base_supported_features.f
+             CLAMP13(robustImageAccess);
+             CLAMP13(inlineUniformBlock);
+             CLAMP13(descriptorBindingInlineUniformBlockUpdateAfterBind);
+             CLAMP13(pipelineCreationCacheControl);
+             CLAMP13(privateData);
+             CLAMP13(shaderDemoteToHelperInvocation);
+             CLAMP13(shaderTerminateInvocation);
+             CLAMP13(subgroupSizeControl);
+             CLAMP13(computeFullSubgroups);
+             CLAMP13(synchronization2);
+             CLAMP13(textureCompressionASTC_HDR);
+             CLAMP13(shaderZeroInitializeWorkgroupMemory);
+             CLAMP13(dynamicRendering);
+             CLAMP13(shaderIntegerDotProduct);
+             CLAMP13(maintenance4);
+#undef CLAMP13
+             break;
+          }
           default:
              break;
       }
       prev = (VkBaseInStructure *)current;
       current = current->pNext;
    }
+}
+
+/*
+ * Force VK_KHR_buffer_device_address / core bufferDeviceAddress on. The
+ * wrapper treats this feature as mandatory and actually used internally, so
+ * it can't just be advertised -- it must be enabled regardless of whether
+ * (or how) the app asked for it. If the app's pNext chain already carries a
+ * struct with the bit, flip it in place (same "mutate the app's request"
+ * pattern already used by the DISABLE_FEATURE macro in wrapper_CreateDevice).
+ * If not, splice `storage` into the (already-copied) wrapper create-info
+ * chain. `storage` must outlive the driver's vkCreateDevice() call.
+ */
+static void
+wrapper_force_buffer_device_address(VkBaseInStructure *create_info,
+                                    VkPhysicalDeviceBufferDeviceAddressFeatures *storage)
+{
+   VkBaseInStructure *current = (VkBaseInStructure *)create_info->pNext;
+
+   while (current != NULL) {
+      if (current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
+         ((VkPhysicalDeviceBufferDeviceAddressFeatures *)current)->bufferDeviceAddress = VK_TRUE;
+         return;
+      }
+      if (current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+         ((VkPhysicalDeviceVulkan12Features *)current)->bufferDeviceAddress = VK_TRUE;
+         return;
+      }
+      current = (VkBaseInStructure *)current->pNext;
+   }
+
+   storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+   storage->bufferDeviceAddress = VK_TRUE;
+   storage->pNext = create_info->pNext;
+   create_info->pNext = (VkBaseInStructure *)storage;
+}
+
+/*
+ * Turn on VK_KHR_vulkan_memory_model's feature bit when the driver actually
+ * supports it. Unlike buffer_device_address above this is best-effort, not
+ * mandatory: if the driver doesn't report the feature we just leave the
+ * chain alone instead of failing device creation.
+ */
+static void
+wrapper_use_vulkan_memory_model(VkBaseInStructure *create_info,
+                                struct wrapper_physical_device *pdevice,
+                                VkPhysicalDeviceVulkanMemoryModelFeatures *storage)
+{
+   if (!pdevice->base_supported_features.vulkanMemoryModel)
+      return;
+
+   VkBaseInStructure *current = (VkBaseInStructure *)create_info->pNext;
+
+   while (current != NULL) {
+      if (current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES) {
+         ((VkPhysicalDeviceVulkanMemoryModelFeatures *)current)->vulkanMemoryModel = VK_TRUE;
+         return;
+      }
+      if (current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+         ((VkPhysicalDeviceVulkan12Features *)current)->vulkanMemoryModel = VK_TRUE;
+         return;
+      }
+      current = (VkBaseInStructure *)current->pNext;
+   }
+
+   storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+   storage->vulkanMemoryModel = VK_TRUE;
+   storage->pNext = create_info->pNext;
+   create_info->pNext = (VkBaseInStructure *)storage;
+}
+
+/*
+ * Force the four Valhall-mandatory feature bits on, the same
+ * "mutate in place if present, splice a struct in if not" pattern as
+ * wrapper_force_buffer_device_address() above. dynamicRendering and
+ * multiview are also recognized via their core-promoted aggregate structs
+ * (Vulkan 1.3 / 1.1 features) to avoid adding a redundant, spec-invalid
+ * duplicate struct when the app already requested the core version struct.
+ */
+static void
+wrapper_force_valhall_features(VkBaseInStructure *create_info,
+   VkPhysicalDeviceDynamicRenderingFeatures *dr_storage,
+   VkPhysicalDeviceDynamicRenderingLocalReadFeatures *drlr_storage,
+   VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT *dru_storage,
+   VkPhysicalDeviceMultiviewFeatures *mv_storage)
+{
+   bool have_dynamic_rendering = false;
+   bool have_local_read = false;
+   bool have_unused_attachments = false;
+   bool have_multiview = false;
+
+   for (VkBaseInStructure *current = (VkBaseInStructure *)create_info->pNext;
+        current != NULL; current = (VkBaseInStructure *)current->pNext) {
+      switch (current->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+         ((VkPhysicalDeviceVulkan13Features *)current)->dynamicRendering = VK_TRUE;
+         have_dynamic_rendering = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+         ((VkPhysicalDeviceVulkan11Features *)current)->multiview = VK_TRUE;
+         have_multiview = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
+         ((VkPhysicalDeviceDynamicRenderingFeatures *)current)->dynamicRendering = VK_TRUE;
+         have_dynamic_rendering = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES:
+         ((VkPhysicalDeviceDynamicRenderingLocalReadFeatures *)current)->dynamicRenderingLocalRead = VK_TRUE;
+         have_local_read = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
+         ((VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT *)current)->dynamicRenderingUnusedAttachments = VK_TRUE;
+         have_unused_attachments = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES:
+         ((VkPhysicalDeviceMultiviewFeatures *)current)->multiview = VK_TRUE;
+         have_multiview = true;
+         break;
+      default:
+         break;
+      }
+   }
+
+   if (!have_dynamic_rendering) {
+      dr_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+      dr_storage->dynamicRendering = VK_TRUE;
+      dr_storage->pNext = create_info->pNext;
+      create_info->pNext = (VkBaseInStructure *)dr_storage;
+   }
+   if (!have_local_read) {
+      drlr_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES;
+      drlr_storage->dynamicRenderingLocalRead = VK_TRUE;
+      drlr_storage->pNext = create_info->pNext;
+      create_info->pNext = (VkBaseInStructure *)drlr_storage;
+   }
+   if (!have_unused_attachments) {
+      dru_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
+      dru_storage->dynamicRenderingUnusedAttachments = VK_TRUE;
+      dru_storage->pNext = create_info->pNext;
+      create_info->pNext = (VkBaseInStructure *)dru_storage;
+   }
+   if (!have_multiview) {
+      mv_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
+      mv_storage->multiview = VK_TRUE;
+      mv_storage->pNext = create_info->pNext;
+      create_info->pNext = (VkBaseInStructure *)mv_storage;
+   }
+}
+
+/*
+ * Prefer the extensible vkBindBufferMemory2 (core since 1.1, or
+ * VK_KHR_bind_memory2) over the legacy single-bind entrypoint whenever the
+ * driver has it, falling back otherwise. For internal wrapper-owned buffers
+ * only (staging/transcode buffers) -- distinct from the real
+ * wrapper_BindBufferMemory/wrapper_BindBufferMemory2 entrypoints above,
+ * which already each forward to their own matching driver entrypoint.
+ */
+static VkResult
+wrapper_internal_bind_buffer_memory(struct wrapper_device *device, VkBuffer buffer,
+                                    VkDeviceMemory memory, VkDeviceSize offset)
+{
+   bool have_bind2 =
+      device->physical->base_supported_extensions.KHR_bind_memory2 ||
+      device->physical->properties2.properties.apiVersion >= VK_API_VERSION_1_1;
+
+   if (have_bind2 && device->dispatch_table.BindBufferMemory2) {
+      VkBindBufferMemoryInfo bind_info = {
+         .sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+         .buffer = buffer,
+         .memory = memory,
+         .memoryOffset = offset,
+      };
+      return device->dispatch_table.BindBufferMemory2(
+         device->dispatch_handle, 1, &bind_info);
+   }
+
+   return device->dispatch_table.BindBufferMemory(
+      device->dispatch_handle, buffer, memory, offset);
+}
+
+/*
+ * Query a buffer's real memory requirements via vkGetBufferMemoryRequirements2
+ * (core since 1.1, or VK_KHR_get_memory_requirements2) instead of assuming
+ * the allocation only ever needs exactly `fallback_size` bytes -- drivers are
+ * free to require more (alignment/padding).
+ */
+static VkDeviceSize
+wrapper_internal_buffer_alloc_size(struct wrapper_device *device, VkBuffer buffer,
+                                   VkDeviceSize fallback_size)
+{
+   bool have_reqs2 =
+      device->physical->base_supported_extensions.KHR_get_memory_requirements2 ||
+      device->physical->properties2.properties.apiVersion >= VK_API_VERSION_1_1;
+
+   if (have_reqs2 && device->dispatch_table.GetBufferMemoryRequirements2) {
+      VkBufferMemoryRequirementsInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+         .buffer = buffer,
+      };
+      VkMemoryRequirements2 reqs = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+      };
+      device->dispatch_table.GetBufferMemoryRequirements2(
+         device->dispatch_handle, &info, &reqs);
+      return reqs.memoryRequirements.size ? reqs.memoryRequirements.size : fallback_size;
+   }
+
+   VkMemoryRequirements legacy_reqs;
+   device->dispatch_table.GetBufferMemoryRequirements(
+      device->dispatch_handle, buffer, &legacy_reqs);
+   return legacy_reqs.size ? legacy_reqs.size : fallback_size;
+}
+
+/*
+ * Prefer vkCmdCopyBufferToImage2 (core since 1.3, or VK_KHR_copy_commands2)
+ * over the legacy entrypoint whenever the driver has it, falling back
+ * otherwise. For the wrapper's internal BCn transcode copies -- distinct
+ * from the real wrapper_CmdCopyBufferToImage/wrapper_CmdCopyBufferToImage2
+ * entrypoints, which intercept the app's own calls.
+ */
+static void
+wrapper_internal_copy_buffer_to_image(struct wrapper_device *device,
+                                      VkCommandBuffer dispatch_handle,
+                                      VkBuffer srcBuffer, VkImage dstImage,
+                                      VkImageLayout dstLayout,
+                                      uint32_t regionCount,
+                                      const VkBufferImageCopy *pRegions)
+{
+   bool have_copy2 =
+      device->physical->base_supported_extensions.KHR_copy_commands2 ||
+      device->physical->properties2.properties.apiVersion >= VK_API_VERSION_1_3;
+
+   if (!have_copy2 || !device->dispatch_table.CmdCopyBufferToImage2) {
+      device->dispatch_table.CmdCopyBufferToImage(dispatch_handle,
+         srcBuffer, dstImage, dstLayout, regionCount, pRegions);
+      return;
+   }
+
+   VkBufferImageCopy2 regions2[regionCount];
+   for (uint32_t i = 0; i < regionCount; i++) {
+      regions2[i] = (VkBufferImageCopy2){
+         .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+         .bufferOffset = pRegions[i].bufferOffset,
+         .bufferRowLength = pRegions[i].bufferRowLength,
+         .bufferImageHeight = pRegions[i].bufferImageHeight,
+         .imageSubresource = pRegions[i].imageSubresource,
+         .imageOffset = pRegions[i].imageOffset,
+         .imageExtent = pRegions[i].imageExtent,
+      };
+   }
+
+   VkCopyBufferToImageInfo2 copy_info2 = {
+      .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
+      .srcBuffer = srcBuffer,
+      .dstImage = dstImage,
+      .dstImageLayout = dstLayout,
+      .regionCount = regionCount,
+      .pRegions = regions2,
+   };
+   device->dispatch_table.CmdCopyBufferToImage2(dispatch_handle, &copy_info2);
 }
 
 static VkResult
@@ -633,6 +1263,41 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    };
    bool used_fallback_create = false;
 
+   /*
+    * VK_KHR_buffer_device_address is mandatory for this wrapper (relied on
+    * internally, not merely forwarded). Fail fast, before allocating
+    * anything, if the driver can't actually back it.
+    */
+   if (!physical_device->base_supported_extensions.KHR_buffer_device_address &&
+       physical_device->properties2.properties.apiVersion < VK_API_VERSION_1_2) {
+      WRAPPER_LOG(error, "Driver lacks mandatory VK_KHR_buffer_device_address");
+      wrapper_emit_diag(physical_device, pCreateInfo, VK_ERROR_EXTENSION_NOT_PRESENT);
+      return vk_error(physical_device, VK_ERROR_EXTENSION_NOT_PRESENT);
+   }
+   if (!physical_device->base_supported_features.bufferDeviceAddress) {
+      WRAPPER_LOG(error, "Driver lacks mandatory bufferDeviceAddress feature");
+      wrapper_emit_diag(physical_device, pCreateInfo, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(physical_device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
+   /*
+    * GPU/driver identification -- read straight off the device, never
+    * assumed -- decides whether this is a Mali Valhall part with more than
+    * one shader core, in which case dynamic rendering + multiview become
+    * mandatory too.
+    */
+   bool wrapper_valhall_mandatory =
+      wrapper_mali_requires_dynamic_rendering(physical_device);
+
+   if (wrapper_valhall_mandatory) {
+      VkResult valhall_result =
+         wrapper_check_valhall_mandatory_extensions(physical_device);
+      if (valhall_result != VK_SUCCESS) {
+         wrapper_emit_diag(physical_device, pCreateInfo, valhall_result);
+         return vk_error(physical_device, valhall_result);
+      }
+   }
+
    device = vk_zalloc2(&physical_device->instance->vk.alloc, pAllocator,
                        sizeof(*device), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!device)
@@ -673,6 +1338,13 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
    wrapper_append_required_extensions(&device->vk,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
+   wrapper_enable_all_driver_extensions(device,
+      &wrapper_enable_extension_count, wrapper_enable_extensions);
+
+   if (wrapper_valhall_mandatory) {
+      wrapper_append_valhall_extensions(
+         &wrapper_enable_extension_count, wrapper_enable_extensions);
+   }
 
    /* VK_EXT_device_fault turns the generic VK_ERROR_DEVICE_LOST into an actual
     * GPU fault report (faulting address + vendor fault codes) that we dump in
@@ -718,6 +1390,30 @@ if (pdf2 && pdf2->features.f) { \
 #undef DISABLE_FEATURE
 
    process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
+
+   /* These storage structs must stay alive through the driver
+    * CreateDevice() call below, so they live in this stack frame rather
+    * than inside the helper functions. */
+   VkPhysicalDeviceBufferDeviceAddressFeatures wrapper_bda_features = {0};
+   wrapper_force_buffer_device_address(
+      (VkBaseInStructure *)&wrapper_create_info, &wrapper_bda_features);
+
+   VkPhysicalDeviceVulkanMemoryModelFeatures wrapper_vmm_features = {0};
+   wrapper_use_vulkan_memory_model(
+      (VkBaseInStructure *)&wrapper_create_info, device->physical,
+      &wrapper_vmm_features);
+
+   VkPhysicalDeviceDynamicRenderingFeatures wrapper_dr_features = {0};
+   VkPhysicalDeviceDynamicRenderingLocalReadFeatures wrapper_drlr_features = {0};
+   VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT wrapper_dru_features = {0};
+   VkPhysicalDeviceMultiviewFeatures wrapper_mv_features = {0};
+
+   if (wrapper_valhall_mandatory) {
+      wrapper_force_valhall_features(
+         (VkBaseInStructure *)&wrapper_create_info,
+         &wrapper_dr_features, &wrapper_drlr_features,
+         &wrapper_dru_features, &wrapper_mv_features);
+   }
 
    /* Request the deviceFault feature. Only inject our struct if the client
     * didn't already provide one (it manages its own if so). */
@@ -2277,12 +2973,9 @@ wrapper_bcn_make_buffer(struct wrapper_device *device, VkDeviceSize size,
       vk_object_free(&device->vk, &device->vk.alloc, b);
       return NULL;
    }
-   VkMemoryRequirements mr;
-   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle,
-      b->dispatch_handle, &mr);
    VkMemoryAllocateInfo ai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = mr.size,
+      .allocationSize = wrapper_internal_buffer_alloc_size(device, b->dispatch_handle, size),
       .memoryTypeIndex = wrapper_select_device_memory_type(device,
          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
    };
@@ -2293,8 +2986,7 @@ wrapper_bcn_make_buffer(struct wrapper_device *device, VkDeviceSize size,
       vk_object_free(&device->vk, &device->vk.alloc, b);
       return NULL;
    }
-   device->dispatch_table.BindBufferMemory(device->dispatch_handle,
-      b->dispatch_handle, b->memory, 0);
+   wrapper_internal_bind_buffer_memory(device, b->dispatch_handle, b->memory, 0);
    b->size = size;
    return b;
 }
@@ -2458,7 +3150,7 @@ wrapper_bcn_gpu_copy(struct wrapper_command_buffer *wcb,
       region.bufferOffset = 0;
       region.bufferRowLength = 0;
       region.bufferImageHeight = 0;
-      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
+      wrapper_internal_copy_buffer_to_image(device, wcb->dispatch_handle,
          dstb->dispatch_handle, dstImage, dstLayout, 1, &region);
 
       srcb->wcb = wcb;
@@ -2535,7 +3227,8 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
 
       VkMemoryAllocateInfo allocate_info = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = upload_size,
+         .allocationSize = wrapper_internal_buffer_alloc_size(device,
+            staging_wb->dispatch_handle, upload_size),
          .memoryTypeIndex = wrapper_select_device_memory_type(device,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
       };
@@ -2549,7 +3242,7 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
          return;
       }
 
-      res = device->dispatch_table.BindBufferMemory(device->dispatch_handle,
+      res = wrapper_internal_bind_buffer_memory(device,
          staging_wb->dispatch_handle, staging_wb->memory, 0);
 
       if (res != VK_SUCCESS) {
@@ -2615,7 +3308,7 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
       copy_region.bufferRowLength = 0;
       copy_region.bufferImageHeight = 0;
 
-      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
+      wrapper_internal_copy_buffer_to_image(device, wcb->dispatch_handle,
          staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
 
       staging_wb->wcb = wcb;
