@@ -632,7 +632,7 @@ wrapper_force_buffer_device_address(VkBaseInStructure *create_info,
 
    storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
    storage->bufferDeviceAddress = VK_TRUE;
-   storage->pNext = create_info->pNext;
+   storage->pNext = (void *)create_info->pNext;
    create_info->pNext = (VkBaseInStructure *)storage;
 }
 
@@ -666,7 +666,7 @@ wrapper_use_vulkan_memory_model(VkBaseInStructure *create_info,
 
    storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
    storage->vulkanMemoryModel = VK_TRUE;
-   storage->pNext = create_info->pNext;
+   storage->pNext = (void *)create_info->pNext;
    create_info->pNext = (VkBaseInStructure *)storage;
 }
 
@@ -725,25 +725,25 @@ wrapper_force_valhall_features(VkBaseInStructure *create_info,
    if (!have_dynamic_rendering) {
       dr_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
       dr_storage->dynamicRendering = VK_TRUE;
-      dr_storage->pNext = create_info->pNext;
+      dr_storage->pNext = (void *)create_info->pNext;
       create_info->pNext = (VkBaseInStructure *)dr_storage;
    }
    if (!have_local_read) {
       drlr_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES;
       drlr_storage->dynamicRenderingLocalRead = VK_TRUE;
-      drlr_storage->pNext = create_info->pNext;
+      drlr_storage->pNext = (void *)create_info->pNext;
       create_info->pNext = (VkBaseInStructure *)drlr_storage;
    }
    if (!have_unused_attachments) {
       dru_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
       dru_storage->dynamicRenderingUnusedAttachments = VK_TRUE;
-      dru_storage->pNext = create_info->pNext;
+      dru_storage->pNext = (void *)create_info->pNext;
       create_info->pNext = (VkBaseInStructure *)dru_storage;
    }
    if (!have_multiview) {
       mv_storage->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
       mv_storage->multiview = VK_TRUE;
-      mv_storage->pNext = create_info->pNext;
+      mv_storage->pNext = (void *)create_info->pNext;
       create_info->pNext = (VkBaseInStructure *)mv_storage;
    }
 }
