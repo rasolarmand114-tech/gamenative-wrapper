@@ -65,7 +65,7 @@ const struct vk_device_extension_table wrapper_device_extensions =
    .EXT_external_memory_host = true,
    .EXT_external_memory_dma_buf = true,
    .EXT_external_memory_acquire_unmodified = true,
-   .EXT_image_drm_format_modifier = true,
+   .EXT_image_drm_format_modifier = false,
    .ANDROID_external_memory_android_hardware_buffer = true,
    /*
     * VK_EXT_device_fault is appended explicitly in wrapper_CreateDevice()
