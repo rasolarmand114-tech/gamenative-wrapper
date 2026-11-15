@@ -68,6 +68,8 @@ jobs:
 
       - name: Compile Project
         run: |
+          ln -s ../util/vk_entrypoints.py src/vulkan/wrapper/vk_entrypoints.py
+          ln -s ../util/vk_extensions.py src/vulkan/wrapper/vk_extensions.py
           meson compile -C _build
 
       - name: Upload Vulkan Wrapper Artifact
