@@ -68,6 +68,7 @@ jobs:
 
       - name: Compile Project
         run: |
+          rm -f src/vulkan/wrapper/vk_extensions.py
           ln -s src/util/vk_extensions.py src/vulkan/wrapper/vk_extensions.py
           meson compile -C _build
 
